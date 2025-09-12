@@ -329,5 +329,4 @@ app.index_string = f"""
 
 if __name__ == "__main__":
     # Si instalas en servidor, cambia host/port según necesites
-    app.run_server(debug=True)
-
+    app.run(debug=True)
