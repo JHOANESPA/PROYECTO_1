@@ -69,12 +69,12 @@ history = model.fit(
 
 # 7. Evaluación
 loss, accuracy = model.evaluate(X_test, y_test, verbose=0)
-print(f"📊 Exactitud en test: {accuracy:.2%}")
+print(f"Exactitud en test: {accuracy:.2%}")
 
 # 8. Guardar modelo y columnas
 model.save("modelo1_sla_tf_norm.h5")
 pd.Series(X.columns).to_csv("columnas_modelo1.csv", index=False)
-print("✅ Modelo 1 y columnas guardadas")
+
 
 # 9. Predicción de ejemplo
 nuevo_ticket = pd.DataFrame([{
@@ -97,4 +97,4 @@ for col in X.columns:
 nuevo_proc = nuevo_proc[X.columns]
 
 prob = model.predict(nuevo_proc, verbose=0)[0][0]
-print(f"🔮 Probabilidad de romper SLA: {prob:.2%}")
+print(f" Probabilidad de romper SLA: {prob:.2%}")
