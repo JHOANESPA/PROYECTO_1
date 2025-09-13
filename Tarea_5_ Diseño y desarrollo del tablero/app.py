@@ -1,332 +1,417 @@
-import io
-import base64
-from pathlib import Path
-import numpy as np
 import pandas as pd
+import numpy as np
+from pathlib import Path
 import plotly.express as px
-from dash import Dash, dcc, html, dash_table, Input, Output, State, callback_context
-
+from dash import Dash, dcc, html, Input, Output, State
 import tensorflow as tf
 import keras
+from sklearn.preprocessing import StandardScaler
 
 # =========================
-# Config / carga de artefactos
+# Rutas y artefactos
 # =========================
 HERE = Path(__file__).resolve().parent
-MODEL_PATH = HERE / "modelo1_sla_tf_norm.h5"
-COLS_PATH = HERE / "columnas_modelo1.csv"
+MODEL_PATH = HERE / "modelo3_sla_tf_stdnum.h5"
+COLS_PATH  = HERE / "columnas_modelo3.csv"
+DATA_PATH  = HERE / "incident_event_log.csv"
 
-model = None
-feature_columns = None
-load_msg = []
+# Lee columnas y elimina índice fantasma "0" si existe
+cols_raw = pd.read_csv(COLS_PATH, header=None).iloc[:, 0]
+feature_columns = cols_raw[cols_raw != "0"].tolist()
 
-try:
-    model = keras.models.load_model(MODEL_PATH)
-    load_msg.append("✅ Modelo cargado")
-except Exception as e:
-    load_msg.append(f"⚠️ No se pudo cargar el modelo: {e}")
+# Modelo
+model = keras.models.load_model(MODEL_PATH)
 
-try:
-    feature_columns = pd.read_csv(COLS_PATH, header=None).iloc[:, 0].tolist()
-    load_msg.append("✅ Columnas de entrenamiento cargadas")
-except Exception as e:
-    load_msg.append(f"⚠️ No se pudo cargar columnas_modelo1.csv: {e}")
+# =========================
+# Datos base y scaler
+# =========================
+df = pd.read_csv(DATA_PATH)
+df3= df.copy()
+df.replace('?', pd.NA, inplace=True)
+df = df.drop_duplicates()
+df.fillna({'resolved_at': df['closed_at']}, inplace=True)
 
-# Variables del usuario (tu diseño)
-FEATURES_NUM = ["reassignment_count", "reopen_count", "sys_mod_count"]
-FEATURES_CAT = ["impact", "urgency", "priority", "category", "assignment_group", "knowledge"]
-TARGET = "made_sla"
+for c in ["opened_at", "resolved_at", "closed_at"]:
+    df[c] = pd.to_datetime(df[c], format="%d/%m/%Y %H:%M", errors="coerce")
 
-# Opciones por defecto (ajústalas si tus datos tienen otras etiquetas)
-IMPACT_OPTS = ["1 - High", "2 - Medium", "3 - Low"]
-URGENCY_OPTS = ["1 - High", "2 - Medium", "3 - Low"]
-PRIORITY_OPTS = ["1 - Critical", "2 - High", "3 - Moderate", "4 - Low"]
-KNOWLEDGE_OPTS = [True, False]
+# Un registro por incidente y variable de tiempo (días)
+df = df.drop_duplicates(subset="number", keep="last").copy()
+df["resolution_time"] = (df["resolved_at"] - df["opened_at"]).dt.total_seconds() / 3600 / 24
+
+# Scaler SOLO en numéricas del dataset original
+scaler = StandardScaler()
+scaler.fit(df[["reassignment_count", "reopen_count", "sys_mod_count"]])
+
+# =========================
+# Diccionario (para tooltips ℹ️)
+# =========================
+diccionario = {
+    "reassignment_count": "Número de veces que el incidente cambió de grupo o analista",
+    "reopen_count": "Número de veces que el usuario rechazó la resolución",
+    "sys_mod_count": "Cantidad de actualizaciones hechas al incidente",
+    "impact": "Nivel de impacto causado (1: Alto, 2: Medio, 3: Bajo)",
+    "urgency": "Urgencia indicada por el usuario (1: Alta, 2: Media, 3: Baja)",
+    "priority": "Prioridad calculada (1: Crítica, 2: Alta, 3: Media, 4: Baja)",
+    "category": "Número de la categoría del servicio afectado",
+    "assignment_group": "Número del grupo de soporte asignado",
+    "knowledge": "Indica si se usó la base de conocimiento"
+}
+
+# Mapas de etiquetas (visual) y órdenes fijos en español
+URG_MAP  = {"1 - High":"Alta", "2 - Medium":"Media", "3 - Low":"Baja"}
+PRIO_MAP = {"1 - Critical":"Crítica", "2 - High":"Alta", "3 - Moderate":"Media", "4 - Low":"Baja"}
+ORDER_URG  = ["Alta", "Media", "Baja"]
+ORDER_PRIO = ["Crítica", "Alta", "Media", "Baja"]
 
 # =========================
 # Utilidades
 # =========================
 def preprocess_single_row(row_dict: dict, feature_columns: list) -> pd.DataFrame:
-    """
-    Toma un dict con las 9 entradas (3 num + 6 cat),
-    crea dummies SOLO para categóricas, alinea columnas con feature_columns.
-    """
     df_row = pd.DataFrame([row_dict])
 
-    # cast tipos
-    df_row["reassignment_count"] = pd.to_numeric(df_row["reassignment_count"], errors="coerce").fillna(0)
-    df_row["reopen_count"] = pd.to_numeric(df_row["reopen_count"], errors="coerce").fillna(0)
-    df_row["sys_mod_count"] = pd.to_numeric(df_row["sys_mod_count"], errors="coerce").fillna(0)
+    # Numéricas
+    for c in ["reassignment_count", "reopen_count", "sys_mod_count"]:
+        df_row[c] = pd.to_numeric(df_row[c], errors="coerce").fillna(0)
 
-    # dummies
-    X_cat = pd.get_dummies(df_row[FEATURES_CAT], drop_first=True)
-    X_num = df_row[FEATURES_NUM]
+    # Escalar SOLO las numéricas
+    df_row[["reassignment_count", "reopen_count", "sys_mod_count"]] = scaler.transform(
+        df_row[["reassignment_count", "reopen_count", "sys_mod_count"]]
+    )
+
+    # Dummies de categóricas
+    X_cat = pd.get_dummies(
+        df_row[["impact", "urgency", "priority", "category", "assignment_group", "knowledge"]],
+        drop_first=True
+    )
+    X_num = df_row[["reassignment_count", "reopen_count", "sys_mod_count"]]
+
+    # Unir y ALINEAR exactamente con columnas del entrenamiento
     X = pd.concat([X_num, X_cat], axis=1).astype("float32")
-
-    # alinear a columnas del entrenamiento
-    for col in feature_columns:
-        if col not in X.columns:
-            X[col] = 0.0
-    # mismo orden
-    X = X[feature_columns].astype("float32")
+    X = X.reindex(columns=feature_columns, fill_value=0.0).astype("float32")
     return X
 
-def parse_upload(contents, filename):
-    """
-    Lee .csv o .xlsx desde el Upload de Dash y regresa un DataFrame.
-    """
-    content_type, content_string = contents.split(',')
-    decoded = base64.b64decode(content_string)
-    if filename.lower().endswith(".csv"):
-        return pd.read_csv(io.BytesIO(decoded))
-    if filename.lower().endswith(".xlsx") or filename.lower().endswith(".xls"):
-        return pd.read_excel(io.BytesIO(decoded))
-    raise ValueError("Formato no soportado. Sube .csv o .xlsx")
-
-def safe_rate_by(df, col):
-    # Calcula % de made_sla=1 por categoría si existen las columnas
-    if TARGET in df.columns and col in df.columns:
-        tmp = (df
-               .groupby(col)[TARGET]
-               .mean()
-               .reset_index(name="tasa_SLA"))
-        return tmp
-    return pd.DataFrame()
+def exists_category_group(cat, grp):
+    cat_full = f"Category {cat}"
+    grp_full = f"Group {grp}"
+    cats = df['category'].dropna().unique()
+    grps = df['assignment_group'].dropna().unique()
+    return cat_full in cats, grp_full in grps
 
 # =========================
-# App y Layout
+# App
 # =========================
 app = Dash(__name__)
-app.title = "SLA Predictor"
+app.title = "Proyecto 1"
 
-badge_model = html.Div(
-    [html.Div(m) for m in load_msg],
-    style={"fontSize": "12px", "color": "#555", "lineHeight": "18px", "marginBottom": "8px"}
-)
+def campo(label_es, id_, type_="text", value=None, info=""):
+    """Campo con tooltip ℹ️ (solo pasar el cursor)."""
+    return html.Div([
+        html.Label([
+            label_es,
+            html.Span(
+                " ℹ️",
+                title=f"{diccionario[info]} (Nombre en los datos: {info}). "
+                      ,
+                style={"cursor":"help","fontSize":"14px","marginLeft":"4px"}
+            )
+        ], style={"display":"block","fontWeight":"600","marginBottom":"4px"}),
+        dcc.Input(
+            id=id_, type=type_, value=value,
+            style={"width":"100%","padding":"6px","borderRadius":"6px","border":"1px solid #ccc"}
+        )
+    ], className="campo")
 
-form_card = html.Div([
-    html.H3("🧾 Ingresar datos del ticket"),
+# -------------------------
+# Layout: Predicción
+# -------------------------
+form_layout = html.Div([
+    html.P("Nota: para conocer la descripción de cada parámetro, "
+           "pasa el cursor sobre el ícono ℹ️ junto al nombre (no hagas clic).",
+           style={"fontSize":"14px","color":"#333","margin":"0 0 12px"}),
+
     html.Div([
-        html.Div([
-            html.Label("reassignment_count"),
-            dcc.Input(id="inp-reassign", type="number", value=3, min=0, step=1, debounce=True),
-        ], className="col"),
-        html.Div([
-            html.Label("reopen_count"),
-            dcc.Input(id="inp-reopen", type="number", value=0, min=0, step=1, debounce=True),
-        ], className="col"),
-        html.Div([
-            html.Label("sys_mod_count"),
-            dcc.Input(id="inp-sysmod", type="number", value=10, min=0, step=1, debounce=True),
-        ], className="col"),
+        html.Div(campo("Conteo de reasignaciones","inp-reassign","number",3,"reassignment_count"), className="col"),
+        html.Div(campo("Conteo de reaperturas","inp-reopen","number",0,"reopen_count"), className="col"),
+        html.Div(campo("Cantidad de modificaciones","inp-sysmod","number",10,"sys_mod_count"), className="col"),
     ], className="row"),
 
     html.Div([
         html.Div([
-            html.Label("impact"),
-            dcc.Dropdown(IMPACT_OPTS, IMPACT_OPTS[0], id="inp-impact", clearable=False),
+            html.Label(["Impacto",
+                html.Span(" ℹ️", title=f"{diccionario['impact']} (Nombre en los datos: impact). "
+                                        "Solo pasa el cursor.", style={"cursor":"help","marginLeft":"4px"})
+            ]),
+            dcc.Dropdown(["1 - High","2 - Medium","3 - Low"], "1 - High", id="inp-impact", clearable=False)
         ], className="col"),
         html.Div([
-            html.Label("urgency"),
-            dcc.Dropdown(URGENCY_OPTS, URGENCY_OPTS[0], id="inp-urgency", clearable=False),
+            html.Label(["Urgencia",
+                html.Span(" ℹ️", title=f"{diccionario['urgency']} (Nombre en los datos: urgency). "
+                                        "Solo pasa el cursor.", style={"cursor":"help","marginLeft":"4px"})
+            ]),
+            dcc.Dropdown(["1 - High","2 - Medium","3 - Low"], "1 - High", id="inp-urgency", clearable=False)
         ], className="col"),
         html.Div([
-            html.Label("priority"),
-            dcc.Dropdown(PRIORITY_OPTS, PRIORITY_OPTS[0], id="inp-priority", clearable=False),
+            html.Label(["Prioridad",
+                html.Span(" ℹ️", title=f"{diccionario['priority']} (Nombre en los datos: priority). "
+                                        "Solo pasa el cursor.", style={"cursor":"help","marginLeft":"4px"})
+            ]),
+            dcc.Dropdown(["1 - Critical","2 - High","3 - Moderate","4 - Low"], "1 - Critical", id="inp-priority", clearable=False)
         ], className="col"),
     ], className="row"),
 
     html.Div([
+        html.Div(campo("Categoría del servicio","inp-category","number",40,"category"), className="col"),
+        html.Div(campo("Grupo asignado","inp-group","number",56,"assignment_group"), className="col"),
         html.Div([
-            html.Label("category (texto exacto)"),
-            dcc.Input(id="inp-category", type="text", value="Category 40"),
-        ], className="col"),
-        html.Div([
-            html.Label("assignment_group (texto exacto)"),
-            dcc.Input(id="inp-group", type="text", value="Group 56"),
-        ], className="col"),
-        html.Div([
-            html.Label("knowledge"),
-            dcc.Dropdown(KNOWLEDGE_OPTS, KNOWLEDGE_OPTS[0], id="inp-knowledge", clearable=False),
+            html.Label(["Uso de base de conocimiento",
+                html.Span(" ℹ️", title=f"{diccionario['knowledge']} (Nombre en los datos: knowledge). "
+                                        "Solo pasa el cursor.", style={"cursor":"help","marginLeft":"4px"})
+            ]),
+            dcc.Dropdown(
+                options=[{"label":"Sí","value":True},{"label":"No","value":False}],
+                value=True, id="inp-knowledge", clearable=False
+            )
         ], className="col"),
     ], className="row"),
 
-    html.Button("Calcular probabilidad", id="btn-predict", n_clicks=0, className="btn"),
-    html.Div(id="pred-output", style={"fontSize": "20px", "marginTop": "10px", "fontWeight": "bold"}),
-], className="card")
+    html.Button("Calcular probabilidad", id="btn-predict", className="boton"),
+    html.Div(id="pred-output", className="pred-box")  # cuadro grande, centrado
+], className="form-card")
 
-upload_card = html.Div([
-    html.H3("📤 Subir datos (CSV/Excel) para visualizaciones"),
-    dcc.Upload(
-        id='upload-data',
-        children=html.Div(['Arrastra y suelta o ', html.A('selecciona archivo')]),
-        style={
-            'width': '100%', 'height': '80px', 'lineHeight': '80px',
-            'borderWidth': '1px', 'borderStyle': 'dashed',
-            'borderRadius': '6px', 'textAlign': 'center', 'margin': '10px 0'
-        },
-        multiple=False
-    ),
-    html.Div(id='upload-info', style={"fontSize": "12px", "color": "#555"}),
+# -------------------------
+# Layout: Exploración
+# -------------------------
+eda_layout = html.Div([
     html.Div([
-        dcc.Graph(id="fig-impact"),
-        dcc.Graph(id="fig-urgency"),
-        dcc.Graph(id="fig-priority"),
-    ])
-], className="card")
+        html.Div(dcc.Graph(id="fig-sla-pie"), className="col"),
+        html.Div(dcc.Graph(id="fig-resolucion"), className="col"),
+    ], className="row"),
 
-help_card = html.Div([
-    html.H3("ℹ️ Instrucciones"),
-    html.Ul([
-        html.Li("Ingresa valores y presiona “Calcular probabilidad”."),
-        html.Li("La probabilidad mostrada es de ROMPER el SLA (salida sigmoide del modelo)."),
-        html.Li("Para gráficos, sube un CSV/XLSX con columnas al menos: "
-                "`impact`, `urgency`, `priority`, `made_sla` y (opcional) las numéricas."),
-        html.Li("Los textos de `category` y `assignment_group` deben coincidir con los del entrenamiento para activar sus dummies."),
-    ])
-], className="card")
+    html.Div([
+        html.Div(dcc.Graph(id="fig-sla_urg_prio"), className="col"),
+        html.Div(dcc.Graph(id="fig-tiempo_urg_prio"), className="col"),
+    ], className="row"),
 
+    html.Div([
+        html.Div(dcc.Graph(id="fig-knowledge"), className="col"),
+        html.Div(dcc.Graph(id="fig-scatter"), className="col"),
+    ], className="row"),
+])
+
+# -------------------------
+# Layout principal
+# -------------------------
 app.layout = html.Div([
-    html.H1("Dashboard – Predicción de SLA"),
-    badge_model,
     html.Div([
-        html.Div(form_card, className="col col-40"),
-        html.Div(upload_card, className="col col-60"),
-    ], className="row"),
-    help_card,
+        html.Div("📊", style={"fontSize":"40px","marginBottom":"8px"}),
+        html.H1("Proyecto 1: Analítica computacional para la toma de decisiones"),
+        html.H3("Dashboard de predicción de cumplimiento de SLA", style={"color":"#444"}),
+    ], style={"textAlign":"center","marginBottom":"30px"}),
 
-    # Estado oculto para almacenar el DF subido
-    dcc.Store(id="store-df")
+    html.P(
+        "Este dashboard permite analizar el comportamiento de los incidentes registrados, "
+        "explorar patrones de resolución y predecir la probabilidad de romper el SLA para un nuevo incidente, "
+        "considerando sus características principales.",
+        style={"maxWidth":"900px","margin":"0 auto 40px","textAlign":"center","fontSize":"16px"}
+    ),
+
+    dcc.Tabs(id="tabs", value="tab-2", children=[
+        dcc.Tab(label="📊 Exploración de Datos", value="tab-2", children=[eda_layout]),
+        dcc.Tab(label="🔮 Predicción", value="tab-1", children=[form_layout]),
+    ])
 ], className="container")
 
 # =========================
 # Callbacks
 # =========================
 @app.callback(
-    Output("pred-output", "children"),
-    Input("btn-predict", "n_clicks"),
-    State("inp-reassign", "value"),
-    State("inp-reopen", "value"),
-    State("inp-sysmod", "value"),
-    State("inp-impact", "value"),
-    State("inp-urgency", "value"),
-    State("inp-priority", "value"),
-    State("inp-category", "value"),
-    State("inp-group", "value"),
-    State("inp-knowledge", "value"),
+    Output("pred-output","children"),
+    Input("btn-predict","n_clicks"),
+    State("inp-reassign","value"),
+    State("inp-reopen","value"),
+    State("inp-sysmod","value"),
+    State("inp-impact","value"),
+    State("inp-urgency","value"),
+    State("inp-priority","value"),
+    State("inp-category","value"),
+    State("inp-group","value"),
+    State("inp-knowledge","value"),
     prevent_initial_call=True
 )
 def make_prediction(nc, reassignment, reopen, sysmod, impact, urgency, priority, category, group, knowledge):
-    if model is None or feature_columns is None:
-        return "⚠️ No hay modelo/columnas cargadas."
+    cat_ok, grp_ok = exists_category_group(category, group)
+    if not cat_ok or not grp_ok:
+        return html.Div(
+            f"⚠️ Categoría {'OK' if cat_ok else 'NO encontrada'} | Grupo {'OK' if grp_ok else 'NO encontrado'}",
+            style={"color":"#b42318","textAlign":"center","fontSize":"24px","padding":"20px","border":"1px solid #f0c2c2","borderRadius":"10px","background":"#fff5f5"}
+        )
 
     row = {
-        "reassignment_count": reassignment or 0,
-        "reopen_count": reopen or 0,
-        "sys_mod_count": sysmod or 0,
+        "reassignment_count": reassignment,
+        "reopen_count": reopen,
+        "sys_mod_count": sysmod,
         "impact": impact,
         "urgency": urgency,
         "priority": priority,
-        "category": category or "",
-        "assignment_group": group or "",
-        "knowledge": bool(knowledge),
+        "category": f"Category {category}",
+        "assignment_group": f"Group {group}",
+        "knowledge": knowledge,
     }
+
     X = preprocess_single_row(row, feature_columns)
-    prob = float(model.predict(X, verbose=0)[0][0])  # prob de romper SLA
-    pct = f"{prob*100:.2f}%"
+    prob = float(model.predict(X, verbose=0)[0][0])
+    pct  = f"{prob*100:.2f}%"
 
-    # color semáforo
     if prob < 0.33:
-        color = "#1a7f37"  # verde
-        txt = "Riesgo BAJO de romper SLA"
+        color, txt = "#1a7f37", "Riesgo BAJO de romper SLA"
+        bg = "#eaf6ed"
     elif prob < 0.66:
-        color = "#b7791f"  # amarillo
-        txt = "Riesgo MEDIO de romper SLA"
+        color, txt = "#b7791f", "Riesgo MEDIO de romper SLA"
+        bg = "#fff6e5"
     else:
-        color = "#b42318"  # rojo
-        txt = "Riesgo ALTO de romper SLA"
+        color, txt = "#b42318", "Riesgo ALTO de romper SLA"
+        bg = "#ffecec"
 
-    return html.Span([f"Probabilidad: {pct} – ", txt], style={"color": color})
-
-@app.callback(
-    Output("store-df", "data"),
-    Output("upload-info", "children"),
-    Input("upload-data", "contents"),
-    State("upload-data", "filename"),
-    prevent_initial_call=True
-)
-def handle_upload(contents, filename):
-    if contents is None:
-        return None, ""
-    try:
-        df = parse_upload(contents, filename)
-        info = f"Archivo cargado: {filename} – filas: {len(df):,}"
-        # Reducir tamaño para almacenarlo en Store (opcional)
-        return df.to_json(date_format='iso', orient='split'), info
-    except Exception as e:
-        return None, f"Error al leer el archivo: {e}"
+    return html.Div(
+        f"Probabilidad: {pct} – {txt}",
+        style={"color":color,"textAlign":"center","fontSize":"26px","padding":"20px",
+               "border":"1px solid #e5e7eb","borderRadius":"10px","background":bg}
+    )
 
 @app.callback(
-    Output("fig-impact", "figure"),
-    Output("fig-urgency", "figure"),
-    Output("fig-priority", "figure"),
-    Input("store-df", "data")
+    Output("fig-sla-pie","figure"),
+    Output("fig-resolucion","figure"),
+    Output("fig-sla_urg_prio","figure"),
+    Output("fig-tiempo_urg_prio","figure"),
+    Output("fig-knowledge","figure"),
+    Output("fig-scatter","figure"),
+    Input("tabs","value")
 )
-def make_charts(df_json):
-    empty_fig = px.scatter(title="Sube un archivo para ver gráficos")
-    if not df_json:
-        return empty_fig, empty_fig, empty_fig
+def make_eda_graphs(tab):
+    if tab != "tab-2":
+        return [px.scatter(title="")]*6
 
-    df = pd.read_json(df_json, orient='split')
+    df_plot = df.copy()
+    df_plot["Cumplió SLA"] = df_plot["made_sla"].map({True:"Sí", False:"No"})
 
-    f1 = safe_rate_by(df, "impact")
-    f2 = safe_rate_by(df, "urgency")
-    f3 = safe_rate_by(df, "priority")
+    # 1) Pie SLA
+    fig1 = px.pie(
+        values=df_plot['Cumplió SLA'].value_counts().values,
+        names=df_plot['Cumplió SLA'].value_counts().index,
+        title="<b>Proporción de incidentes que cumplen o rompen el SLA</b>"
+    )
 
-    fig1 = px.bar(f1, x="impact", y="tasa_SLA", title="Tasa de cumplimiento SLA por Impact")
-    fig2 = px.bar(f2, x="urgency", y="tasa_SLA", title="Tasa de cumplimiento SLA por Urgency")
-    fig3 = px.bar(f3, x="priority", y="tasa_SLA", title="Tasa de cumplimiento SLA por Priority")
+    # 2) Histograma (log Y)
+    fig2 = px.histogram(
+        df_plot, x="resolution_time", color="Cumplió SLA",
+        nbins=50, log_y=True,
+        title="<b>Distribución del tiempo de resolución según cumplimiento del SLA</b>"
+    )
+    fig2.update_xaxes(title="<b>Tiempo de resolución (días)</b>")
+    fig2.update_yaxes(title="<b>Cantidad de incidentes</b>")
 
-    for fig in (fig1, fig2, fig3):
-        fig.update_yaxes(tickformat=".0%", rangemode="tozero")
+    # 3) Heatmap % SLA 
+    #    No se cambian los valores; solo se cambian los textos de ticks en los ejes.
+    sla_group_cat = df3.pivot_table(
+        index="urgency",
+        columns="priority",
+        values="made_sla",
+        aggfunc="mean"
+    )
+    fig3 = px.imshow(
+        sla_group_cat, text_auto=".2f", color_continuous_scale="RdYlGn",
+        title="<b>% de SLA cumplido por urgencia y prioridad</b>"
+    )
+    # Etiquetas de ejes en español (manteniendo el orden/calculo original)
+    fig3.update_xaxes(
+        title="<b>Prioridad del incidente</b>",
+        ticktext=[PRIO_MAP.get(c, c) for c in sla_group_cat.columns],
+        tickvals=list(range(len(sla_group_cat.columns)))
+    )
+    fig3.update_yaxes(
+        title="<b>Urgencia informada por cliente</b>",
+        ticktext=[URG_MAP.get(r, r) for r in sla_group_cat.index],
+        tickvals=list(range(len(sla_group_cat.index)))
+    )
 
-    return fig1, fig2, fig3
+    # 4) Heatmap tiempo promedio
+    sla_time = df_plot.pivot_table(index="urgency", columns="priority", values="resolution_time", aggfunc="mean")
+    fig4 = px.imshow(
+        sla_time, text_auto=".2f", color_continuous_scale="RdYlGn_r",
+        title="<b>Tiempo promedio de resolución (días) por Urgencia y Prioridad</b>"
+    )
+    fig4.update_xaxes(
+        title="<b>Prioridad del incidente</b>",
+        ticktext=[PRIO_MAP.get(c, c) for c in sla_time.columns],
+        tickvals=list(range(len(sla_time.columns)))
+    )
+    fig4.update_yaxes(
+        title="<b>Urgencia informada por cliente</b>",
+        ticktext=[URG_MAP.get(r, r) for r in sla_time.index],
+        tickvals=list(range(len(sla_time.index)))
+    )
+
+    # 5) Pie knowledge
+    tabla = pd.crosstab(df_plot['knowledge'], df_plot['Cumplió SLA'])
+    fig5 = px.pie(
+        values=tabla.sum(axis=1),
+        names=["No","Sí"],
+        title="<b>Uso de base de conocimiento en incidentes</b>"
+    )
+
+    # 6) Dispersión
+    fig6 = px.scatter(
+        df_plot, x="resolution_time", y="sys_mod_count", color="Cumplió SLA",
+        title="<b>Relación entre tiempo de resolución y cantidad de modificaciones</b>"
+    )
+    fig6.update_xaxes(title="<b>Tiempo de resolución (días)</b>")
+    fig6.update_yaxes(title="<b>Cantidad de modificaciones</b>")
+
+    # Títulos centrados y en negro
+    for fig in [fig1, fig2, fig3, fig4, fig5, fig6]:
+        fig.update_layout(
+            title={'x':0.5,'xanchor':'center'},
+            title_font=dict(size=16, color="#000", family="Segoe UI"),
+            margin={'t':90}
+        )
+
+    return fig1, fig2, fig3, fig4, fig5, fig6
 
 # =========================
-# Estilos rápidos (CSS mínimo)
+# CSS incrustado
 # =========================
-APP_CSS = """
-.container { max-width: 1100px; margin: 20px auto; font-family: system-ui, Arial; }
-.row { display: flex; gap: 16px; flex-wrap: wrap; }
-.col { flex: 1; min-width: 260px; }
-.col-40 { flex: 0 0 40%; }
-.col-60 { flex: 0 0 58%; }
-.card { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 16px; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
-label { display:block; font-size: 12px; color:#555; margin-bottom: 6px; }
-.btn { margin-top: 10px; padding: 8px 12px; border-radius: 8px; border: 1px solid #e5e7eb; background: #f3f4f6; cursor: pointer; }
-"""
-
-app.index_string = f"""
+app.index_string = """
 <!DOCTYPE html>
 <html>
-    <head>
-        {{%metas%}}
-        <title>{{%title%}}</title>
-        {{%favicon%}}
-        {{%css%}}
-        <style>{APP_CSS}</style>
-    </head>
-    <body>
-        {{%app_entry%}}
-        <footer>
-            {{%config%}}
-            {{%scripts%}}
-            {{%renderer%}}
-        </footer>
-    </body>
+<head>
+    {%metas%}
+    <title>{%title%}</title>
+    {%favicon%}
+    {%css%}
+    <style>
+        body { font-family: 'Segoe UI', system-ui, Arial; background: #f7f8fa; }
+        .container { max-width: 1120px; margin: 22px auto; }
+        .row { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 24px; }
+        .col { flex: 1; min-width: 260px; background:#fff; border:1px solid #eee; border-radius:10px; padding:16px; }
+        .form-card { background:#fff; padding:20px; border-radius:10px; box-shadow:0 2px 4px rgba(0,0,0,.05); }
+        .campo { margin-bottom: 16px; }
+        .boton { margin-top: 10px; padding: 10px 16px; border:none; background:#0069d9; color:#fff; border-radius:8px; cursor:pointer; display:block; margin-left:auto; margin-right:auto; }
+        .boton:hover { background:#0053b3; }
+        .pred-box { margin-top:18px; text-align:center; font-size:24px; }
+        label { font-weight: 600; }
+    </style>
+</head>
+<body>
+    {%app_entry%}
+    <footer>
+        {%config%}
+        {%scripts%}
+        {%renderer%}
+    </footer>
+</body>
 </html>
 """
 
 if __name__ == "__main__":
-    # Si instalas en servidor, cambia host/port según necesites
     app.run(debug=True)
+
