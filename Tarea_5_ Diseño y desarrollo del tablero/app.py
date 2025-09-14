@@ -263,14 +263,14 @@ def make_prediction(nc, reassignment, reopen, sysmod, impact, urgency, priority,
     pct  = f"{prob*100:.2f}%"
 
     if prob < 0.33:
-        color, txt = "#1a7f37", "Riesgo BAJO de romper SLA"
-        bg = "#eaf6ed"
+        color, txt = "#b42318", "Riesgo ALTO de no cumplir con el acuerdo de servicio con el cliente (SLA)"
+        bg = "#ffecec"
     elif prob < 0.66:
-        color, txt = "#b7791f", "Riesgo MEDIO de romper SLA"
+        color, txt = "#b7791f", "Riesgo MEDIO de no cumplir con el acuerdo de servicio con el cliente (SLA)"
         bg = "#fff6e5"
     else:
-        color, txt = "#b42318", "Riesgo ALTO de romper SLA"
-        bg = "#ffecec"
+        color, txt = "#1a7f37", "Riesgo BAJO de no cumplir con el acuerdo de servicio con el cliente (SLA)"
+        bg = "#eaf6ed"
 
     return html.Div(
         f"Probabilidad: {pct} – {txt}",
@@ -414,4 +414,3 @@ app.index_string = """
 
 if __name__ == "__main__":
     app.run(debug=True)
-
